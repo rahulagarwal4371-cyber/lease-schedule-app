@@ -1,4 +1,7 @@
 streamlit
 pandas
-python-dateutil
 openpyxl
+python-dateutil
+pdfplumber
+docx2txt
+google-genai
