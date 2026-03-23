@@ -13,6 +13,9 @@ from google import genai
 st.set_page_config(page_title="Lease Schedule Generator", layout="centered")
 st.title("📑 Lease Schedule Generator (Stub + Escalation + Monthly Discounting)")
 
+MIN_DATE = datetime(1900, 1, 1).date()
+MAX_DATE = datetime(2100, 12, 31).date()
+
 # ===============================
 # Helper: Extract lease fields using Gemini
 # ===============================
@@ -52,8 +55,7 @@ Return ONLY a valid JSON object with exactly these keys and no other text, pream
         }
     ],
     "has_purchase_option": "true or false or null",
-    "purchase_option_price": "float or null",
-    "has_cmc": "true or false or null"
+    "purchase_option_price": "float or null"
 }
 
 Rules:
@@ -67,7 +69,6 @@ Rules:
 - For is_cancellable, set true if lease has early termination/cancellation clause
 - For has_purchase_option, set true if agreement contains option to purchase asset at end of lease
 - For purchase_option_price, extract the fixed purchase price mentioned
-- For has_cmc, set true if agreement mentions Comprehensive Maintenance Contract
 - Dates must be in YYYY-MM-DD format
 - Return ONLY the JSON, no markdown, no explanation, no ```json fences
 """
@@ -152,22 +153,32 @@ def ex(key, default=None):
 st.subheader("📋 Lease Details")
 
 # Lease Start Date
-default_start = datetime.today()
+default_start = datetime.today().date()
 if ex("lease_start_date"):
     try:
-        default_start = datetime.strptime(ex("lease_start_date"), "%Y-%m-%d")
+        default_start = datetime.strptime(ex("lease_start_date"), "%Y-%m-%d").date()
     except:
         pass
-lease_start = st.date_input("Lease Start Date", default_start)
+lease_start = st.date_input(
+    "Lease Start Date",
+    value=default_start,
+    min_value=MIN_DATE,
+    max_value=MAX_DATE
+)
 
 # Lease End Date
-default_end = datetime.today()
+default_end = datetime.today().date()
 if ex("lease_end_date"):
     try:
-        default_end = datetime.strptime(ex("lease_end_date"), "%Y-%m-%d")
+        default_end = datetime.strptime(ex("lease_end_date"), "%Y-%m-%d").date()
     except:
         pass
-lease_end_date = st.date_input("Lease End Date", default_end)
+lease_end_date = st.date_input(
+    "Lease End Date",
+    value=default_end,
+    min_value=MIN_DATE,
+    max_value=MAX_DATE
+)
 
 # Payment Timing
 timing_options = ["Beginning", "End"]
@@ -240,6 +251,7 @@ purchase_option_exists = st.checkbox(
 
 exercise_purchase_option = False
 purchase_option_price = 0.0
+asset_life_months = 0
 
 if purchase_option_exists:
     default_purchase_price = float(ex("purchase_option_price", 0.0))
@@ -256,25 +268,11 @@ if purchase_option_exists:
 
     if exercise_purchase_option:
         st.success("✅ Purchase price will be included in PV calculation and lease liability.")
-
-# ---- CMC ----
-st.subheader("🔧 Comprehensive Maintenance Contract (CMC)")
-
-has_cmc = ex("has_cmc", False) in [True, "true", "True"]
-cmc_exists = st.checkbox(
-    "Agreement includes a CMC (Comprehensive Maintenance Contract)",
-    value=has_cmc
-)
-
-asset_life_months = 0
-if cmc_exists and exercise_purchase_option:
-    st.info("ℹ️ ROU asset will be amortized over life of asset.")
-    asset_life_months = st.number_input(
-        "Life of Asset (months)", min_value=1, step=1,
-        value=int(lock_in_period)
-    )
-elif cmc_exists and not exercise_purchase_option:
-    st.info("ℹ️ CMC exists but purchase option not exercised — ROU amortized over lock-in period.")
+        st.info("ℹ️ ROU asset will be amortized over the life of the asset.")
+        asset_life_months = st.number_input(
+            "Life of Asset (months)", min_value=1, step=1,
+            value=int(lock_in_period)
+        )
 
 # ---- Rent Configuration ----
 st.subheader("🏷️ Rent Configuration")
@@ -399,10 +397,10 @@ for j in range(int(num_additional)):
 
     default_label = ap_ex.get("label", f"Deposit {j+1}")
     default_ap_amt = float(ap_ex.get("amount", 0.0))
-    default_ap_date = datetime.today()
+    default_ap_date = datetime.today().date()
     if ap_ex.get("date"):
         try:
-            default_ap_date = datetime.strptime(ap_ex["date"], "%Y-%m-%d")
+            default_ap_date = datetime.strptime(ap_ex["date"], "%Y-%m-%d").date()
         except:
             pass
 
@@ -418,8 +416,13 @@ for j in range(int(num_additional)):
             value=default_ap_amt, key=f"ap_amount_{j}"
         )
     with col3:
-        ap_date = st.date_input(f"Payment Date #{j+1}",
-                                 value=default_ap_date, key=f"ap_date_{j}")
+        ap_date = st.date_input(
+            f"Payment Date #{j+1}",
+            value=default_ap_date,
+            min_value=MIN_DATE,
+            max_value=MAX_DATE,
+            key=f"ap_date_{j}"
+        )
 
     ap_inclusive_gst = st.checkbox(
         f"Amount #{j+1} is inclusive of GST",
@@ -590,31 +593,21 @@ if st.button("Generate Schedule"):
         months_diff = (dates[i].year - t0.year) * 12 + (dates[i].month - t0.month)
 
         if dates[i] < t0:
-            # Prior deposit — no discounting
             period = 0
 
         elif dates[i] == t0:
-            # Payment on day 1 — no discounting
             period = 0
 
         elif i == last_lease_rental_idx:
-            # Last lease rental — full lock-in period
             period = int(lock_in_period)
 
         elif months_diff == 0:
-            # Stub End payment at end of first month
             period = discount_stub_fraction
 
         else:
             if payment_timing.lower() == "beginning":
-                # ✅ Beginning: 2nd payment is on 1st of month 2
-                # Only stub fraction elapsed from t0 to end of stub month
-                # Then full months from start of month 2 onwards
-                # So period = (months_diff - 1) + discount_stub_fraction
                 period = (months_diff - 1) + discount_stub_fraction
             else:
-                # End: payment at end of month
-                # months_diff months + stub fraction elapsed
                 period = months_diff + (discount_stub_fraction if has_stub else 0)
 
         pv = amt / ((1 + monthly_rate) ** period)
@@ -623,7 +616,10 @@ if st.button("Generate Schedule"):
     lease_liability = sum(pv_list)
     ROU_opening = lease_liability
 
-    if exercise_purchase_option and cmc_exists and asset_life_months > 0:
+    # ===============================
+    # ROU Amortization Period
+    # ===============================
+    if exercise_purchase_option and asset_life_months > 0:
         amortization_months = int(asset_life_months)
         st.info(f"ℹ️ ROU asset amortized over **{amortization_months} months** (Life of Asset)")
     else:
@@ -632,14 +628,8 @@ if st.button("Generate Schedule"):
     amortization_per_month = ROU_opening / amortization_months
 
     # ===============================
-    # Step 4: Build Schedule — REBUILT FROM ROOT
+    # Step 4: Build Schedule
     # ===============================
-    has_prior_deposit = any(
-        dates[k] < t0
-        for k in range(len(dates))
-        if labels[k] != "Lease Rental"
-    )
-
     rows = []
     opening_balance = lease_liability
     rou_balance = ROU_opening
@@ -656,36 +646,24 @@ if st.button("Generate Schedule"):
 
         current_date = dates[same_date_indices[0]]
         total_payments_today = sum(amounts[k] for k in same_date_indices)
+        months_diff = (current_date.year - t0.year) * 12 + (current_date.month - t0.month)
 
         # ===============================
-        # Interest — correctly decoupled from discounting for stub Beginning
+        # Interest Calculation
         # ===============================
         if current_date < t0:
-            # Prior deposit — no interest
+            # Prior deposit — lease not yet commenced, no interest
             interest = 0.0
 
-        elif current_date == t0 and not has_stub:
-            # Payment on day 1, no stub — no interest
-            interest = 0.0
-
-        elif current_date == t0 and has_stub:
-            # Payment on day 1 WITH stub — interest still accrues during stub period
-            # Beginning: after deducting payment
-            # End: before deducting payment (but End on t0 shouldn't happen with stub)
-            if payment_timing.lower() == "beginning":
-                interest = (opening_balance - total_payments_today) * monthly_rate * discount_stub_fraction
-            else:
-                interest = opening_balance * monthly_rate * discount_stub_fraction
-
-        elif has_stub and 0 in same_date_indices:
-            # Stub End payment at end of first month
+        elif has_stub and months_diff == 0 and same_date_indices[0] == 0:
+            # First stub period payment
             if payment_timing.lower() == "beginning":
                 interest = (opening_balance - total_payments_today) * monthly_rate * discount_stub_fraction
             else:
                 interest = opening_balance * monthly_rate * discount_stub_fraction
 
         elif last_lease_rental_idx in same_date_indices and has_stub:
-            # Last stub period
+            # Last partial (stub tail) period
             dim_last = calendar.monthrange(current_date.year, current_date.month)[1]
             last_fraction = current_date.day / dim_last
             if payment_timing.lower() == "beginning":
@@ -694,12 +672,14 @@ if st.button("Generate Schedule"):
                 interest = opening_balance * monthly_rate * last_fraction
 
         else:
-            # Regular full month
+            # All regular full months including t0 no-stub first payment
             if payment_timing.lower() == "beginning":
+                # Payment made on day 1; interest accrues on post-payment balance for the month
                 interest = (opening_balance - total_payments_today) * monthly_rate
             else:
+                # Payment at end; interest accrues on full opening balance
                 interest = opening_balance * monthly_rate
-                
+
         # ===============================
         # Apply payments row by row
         # ===============================
@@ -712,8 +692,6 @@ if st.button("Generate Schedule"):
             if not interest_applied:
                 row_interest = interest
                 if payment_timing.lower() == "beginning":
-                    # Opening - all payments today + interest on reduced balance + this payment
-                    # = effective opening for this row after interest
                     balance_after_interest = (opening_balance - total_payments_today) + interest + payment
                 else:
                     balance_after_interest = opening_balance + interest
@@ -757,7 +735,7 @@ if st.button("Generate Schedule"):
             sl_no += 1
 
         i += 1
-        
+
     df = pd.DataFrame(rows, columns=[
         "Sl No.", "Installment Date", "Payment Type", "Amount Paid", "PV of Installment",
         "Opening Lease Liability", "Payment", "Interest", "Closing Lease Liability",
