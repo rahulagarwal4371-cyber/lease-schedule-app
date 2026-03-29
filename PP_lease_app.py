@@ -840,30 +840,33 @@ if st.button("Generate Schedule"):
         # ── Calendar boundaries for this lease month ──────────────────────
         if lm == 1 and has_stub:
             month_start = t0
-            month_end = end_of_month
+            month_end_date = end_of_month
         elif has_stub:
             month_offset = lm - 2
             base_month = end_of_month + timedelta(days=1) + relativedelta(months=month_offset)
             dim = calendar.monthrange(base_month.year, base_month.month)[1]
             month_start = datetime(base_month.year, base_month.month, 1).date()
-            month_end = datetime(base_month.year, base_month.month, dim).date()
+            month_end_date = datetime(base_month.year, base_month.month, dim).date()
         else:
             base_month = t0 + relativedelta(months=lm - 1)
             dim = calendar.monthrange(base_month.year, base_month.month)[1]
             month_start = datetime(base_month.year, base_month.month, 1).date()
-            month_end = datetime(base_month.year, base_month.month, dim).date()
+            month_end_date = datetime(base_month.year, base_month.month, dim).date()
 
         # ── Fraction of month (for interest and ROU amortization) ─────────
         if lm == 1:
             first_payment_date = get_payment_date_for_bucket(1, payment_buckets.get(1, []))
 
             # ✅ If no time gap → no interest
-            if first_payment_date == t0:
-                month_fraction = 0
-            elif has_stub:
-                month_fraction = discount_stub_fraction
-            else:
-                month_fraction = 1.0
+            if lm == 1:
+                days_in_month = calendar.monthrange(t0.year, t0.month)[1]
+                days_used = (end_of_month - t0).days + 1
+
+                # ✅ Only 1-day case (31st scenario)
+                if days_used <= 1:
+                    month_fraction = 0
+                else:
+                    month_fraction = days_used / days_in_month
 
         elif lm == lock_in and has_tail_stub:
             month_fraction = last_month_fraction
@@ -875,7 +878,7 @@ if st.button("Generate Schedule"):
         cash_payments_this_month = [
             (pay_date, p)
             for pay_date, pay_list in payment_map.items()
-            if month_start <= pay_date <= month_end
+            if month_start <= pay_date <= month_end_date
             for p in pay_list
         ]
         cash_payments_this_month.sort(key=lambda x: x[0])
@@ -941,7 +944,7 @@ if st.button("Generate Schedule"):
 
             rows.append([
                 sl_no,
-                month_end.strftime("%Y-%m-%d"),
+                month_end_date.strftime("%Y-%m-%d"),
                 "Interest Accrual",
                 0.0,
                 0.0,
