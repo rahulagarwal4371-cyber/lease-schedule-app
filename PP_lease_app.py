@@ -17,6 +17,51 @@ MIN_DATE = datetime(1900, 1, 1).date()
 MAX_DATE = datetime(2100, 12, 31).date()
 
 # ===============================
+# Helper: Compute lock-in months correctly accounting for stub months
+# ===============================
+def compute_lock_in_months(lease_start, lease_end_date):
+    """
+    Count the number of schedule months between lease_start and lease_end_date.
+
+    When lease_start is NOT the 1st of a month (stub month), month 1 is the
+    partial period from lease_start to the end of that calendar month.  Month 2
+    is the next full calendar month, and so on.  The final schedule month is
+    whichever calendar month contains lease_end_date.
+
+    Example: Mar 10 2024 → Mar 9 2026
+      Month 1  = Mar 10-31 (stub)
+      Month 2  = Apr 2024
+      ...
+      Month 24 = Feb 2026
+      Month 25 = Mar 2026  (contains Mar 9, the lease end)
+      → returns 25
+    """
+    t0 = lease_start
+    days_in_month = calendar.monthrange(t0.year, t0.month)[1]
+    has_stub = (t0.day != 1 and t0.day != days_in_month)
+
+    if not has_stub:
+        # No stub: straightforward month count
+        return (
+            (lease_end_date.year - lease_start.year) * 12 +
+            (lease_end_date.month - lease_start.month) +
+            (1 if lease_end_date.day >= lease_start.day else 0)
+        )
+    else:
+        # Stub present: month 1 is partial, so every subsequent month is one
+        # calendar month further than the raw date-diff would suggest.
+        end_of_stub = datetime(t0.year, t0.month, days_in_month).date()
+        first_full = end_of_stub + timedelta(days=1)          # start of month 2
+        full_months = (
+            (lease_end_date.year - first_full.year) * 12 +
+            (lease_end_date.month - first_full.month)
+        )
+        # 1 (stub month) + full calendar months between month-2-start and
+        # lease_end_date's month + 1 (the month that contains lease_end_date)
+        return 1 + full_months + 1
+
+
+# ===============================
 # Helper: Extract lease fields using Gemini
 # ===============================
 def extract_lease_fields(file_bytes, file_type):
@@ -95,11 +140,19 @@ Rules:
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
+
 # ===============================
 # GST Helper
 # ===============================
 def net_of_gst(amount, gst_rate):
     return amount / (1 + gst_rate / 100)
+
+
+def compute_true_lease_months(start, end):
+    return (
+        (end.year - start.year) * 12 +
+        (end.month - start.month)
+    )
 
 # ===============================
 # Section: Upload Lease Agreement
@@ -147,6 +200,7 @@ def ex(key, default=None):
     val = extracted.get(key)
     return default if val is None else val
 
+
 # ===============================
 # ---- User Inputs ----
 # ===============================
@@ -186,6 +240,47 @@ default_timing_idx = timing_options.index(ex("payment_timing", "Beginning")) \
     if ex("payment_timing") in timing_options else 0
 payment_timing = st.radio("Payments Timing", timing_options, index=default_timing_idx)
 
+# ---- Payment Frequency ----
+st.subheader("🗓️ Payment Frequency")
+
+frequency_options = {
+    "Monthly (every 1 month)": 1,
+    "Bi-Monthly (every 2 months)": 2,
+    "Quarterly (every 3 months)": 3,
+    "Half-Yearly (every 6 months)": 6,
+    "Annually (every 12 months)": 12,
+}
+selected_frequency_label = st.selectbox(
+    "Payment Frequency",
+    list(frequency_options.keys()),
+    index=0,
+    help="How often rent payments are made. The schedule remains monthly; payments are aggregated per frequency."
+)
+payment_frequency = frequency_options[selected_frequency_label]
+
+# Starting month of payment (only relevant when frequency > 1)
+payment_start_month = 1
+if payment_frequency > 1:
+    st.info(
+        f"ℹ️ Payments are made every **{payment_frequency} months**. "
+        f"Please select which month (within the cycle) the first payment falls in."
+    )
+    payment_start_month = st.number_input(
+        f"Starting Month of First Payment (1 to {payment_frequency})",
+        min_value=1,
+        max_value=payment_frequency,
+        value=1,
+        step=1,
+        help=(
+            f"E.g. if frequency is quarterly (3 months) and you set starting month = 2, "
+            f"payments will fall in months 2, 5, 8, 11, ... of the lease."
+        )
+    )
+    st.caption(
+        f"📅 Payments will occur in lease months: "
+        f"{', '.join(str(payment_start_month + i * payment_frequency) for i in range(min(5, (int((ex('lock_in_period_months', 36) or 36) - payment_start_month) // payment_frequency) + 1)))}..."
+    )
+
 # Interest Rate
 interest_rate = st.number_input("Annual Interest Rate (%)", min_value=0.0, step=0.1)
 
@@ -205,11 +300,8 @@ if lease_cancellable == "Cancellable":
     st.info(f"🔒 Lock-in End Date: {lock_in_end.strftime('%Y-%m-%d')} | "
             f"📅 Lease End Date (Reference): {lease_end_date.strftime('%Y-%m-%d')}")
 else:
-    lock_in_period = (
-        (lease_end_date.year - lease_start.year) * 12 +
-        (lease_end_date.month - lease_start.month) +
-        (1 if lease_end_date.day >= lease_start.day else 0)
-    )
+    # Use compute_lock_in_months to correctly handle stub-month boundary shifts
+    lock_in_period = compute_lock_in_months(lease_start, lease_end_date)
     st.info(f"📅 Lease End Date: {lease_end_date.strftime('%Y-%m-%d')} | "
             f"🔒 Derived Lease Term: {lock_in_period} months")
 
@@ -285,13 +377,20 @@ default_rent_mode = "Period-wise Rent" \
 rent_mode = st.radio("Rent Input Mode", rent_mode_options,
                       index=rent_mode_options.index(default_rent_mode))
 
+if payment_frequency > 1:
+    st.info(
+        f"ℹ️ **Frequency note:** Enter the **monthly rent** amount below. "
+        f"The schedule will aggregate payments every {payment_frequency} months "
+        f"(i.e. each payment = {payment_frequency} × monthly rent, adjusted for stubs)."
+    )
+
 installment_amount = 0.0
 rent_periods = []
 
 if rent_mode == "Single Installment Amount":
     default_amt = float(ex("installment_amount", 0.0))
     installment_amount = st.number_input(
-        "Installment Amount (as per agreement, inclusive of GST if applicable)",
+        "Monthly Installment Amount (as per agreement, inclusive of GST if applicable)",
         min_value=0.0, step=100.0, value=default_amt
     )
 
@@ -442,6 +541,7 @@ for j in range(int(num_additional)):
         "date": ap_date
     })
 
+
 # ===============================
 # Generate Schedule
 # ===============================
@@ -475,13 +575,52 @@ if st.button("Generate Schedule"):
             )
             st.stop()
 
+    # ---- Validate starting month ----
+    if payment_frequency > 1 and payment_start_month > payment_frequency:
+        st.error(
+            f"❌ Starting month ({payment_start_month}) cannot exceed "
+            f"the payment frequency ({payment_frequency} months)."
+        )
+        st.stop()
+
     t0 = lease_start
     annual_rate = interest_rate / 100
     monthly_rate = annual_rate / 12
 
-    # ===============================
-    # Step 1: Build monthly rent schedule (net of GST)
-    # ===============================
+    # -----------------------------------------------------------------------
+    # Pre-compute stub / tail-stub metadata
+    # -----------------------------------------------------------------------
+    days_in_first_month = calendar.monthrange(t0.year, t0.month)[1]
+    end_of_month = datetime(t0.year, t0.month, days_in_first_month).date()
+
+    # A stub exists when lease starts after the 1st and before the last day
+    has_stub = (t0.day != 1 and t0.day != days_in_first_month)
+
+    lock_in = int(lock_in_period)
+
+    # Actual lease end date:
+    #   Non-cancellable → use the user-supplied lease_end_date directly
+    #   Cancellable     → derive from lock_in (user entered months manually)
+    if lease_cancellable == "Non-Cancellable":
+        lease_end = lease_end_date
+    else:
+        lease_end = t0 + relativedelta(months=lock_in) - timedelta(days=1)
+
+    # ✅ ALWAYS define (outside if-else)
+    true_lease_months = compute_true_lease_months(t0, lease_end)
+
+    # Stub fraction: proportion of the first calendar month covered
+    stub_days_count = (end_of_month - t0).days + 1 if has_stub else days_in_first_month
+    discount_stub_fraction = stub_days_count / days_in_first_month
+
+    # Tail-stub fraction: proportion of the last calendar month covered
+    last_dim = calendar.monthrange(lease_end.year, lease_end.month)[1]
+    last_month_fraction = lease_end.day / last_dim
+    has_tail_stub = (lease_end.day != last_dim)
+
+    # -----------------------------------------------------------------------
+    # Step 1: Build monthly rent schedule (net of GST, length = lock_in)
+    # -----------------------------------------------------------------------
     monthly_rents = []
 
     def apply_gst(amount):
@@ -492,7 +631,7 @@ if st.button("Generate Schedule"):
     if rent_mode == "Single Installment Amount":
         base_rent = apply_gst(installment_amount)
         current_rent = base_rent
-        for m in range(1, int(lock_in_period) + 1):
+        for m in range(1, lock_in + 1):
             if escalation_type != "None" and m > 1 and (m - 1) % escalation_interval == 0:
                 if escalation_type == "Percentage":
                     current_rent = current_rent * (1 + escalation_rate / 100)
@@ -500,7 +639,7 @@ if st.button("Generate Schedule"):
                     current_rent = current_rent + apply_gst(escalation_amount)
             monthly_rents.append(current_rent)
     else:
-        months_remaining = int(lock_in_period)
+        months_remaining = lock_in
         for period in rent_periods:
             if months_remaining <= 0:
                 break
@@ -510,243 +649,345 @@ if st.button("Generate Schedule"):
                 monthly_rents.append(net_rent)
             months_remaining -= months_to_use
 
-    # ===============================
-    # Step 2: Build Payment Dates with Stub
-    # ===============================
-    dates = []
-    amounts = []
-    labels = []
+    # -----------------------------------------------------------------------
+    # Step 2: Determine payment months (based on frequency and starting month)
+    # -----------------------------------------------------------------------
+    payment_months_set = set()
+    m = payment_start_month
+    while m <= lock_in:
+        payment_months_set.add(m)
+        m += payment_frequency
 
-    days_in_month = calendar.monthrange(t0.year, t0.month)[1]
-    end_of_month = datetime(t0.year, t0.month, days_in_month).date()
+    # -----------------------------------------------------------------------
+    # Step 3: Build payment_buckets
+    #   Maps payment_month_num → list of lease month numbers whose rent is
+    #   collected in that payment.
+    #
+    #   The last lease month (lock_in) always gets its own dedicated bucket
+    #   so it is never silently merged into an earlier one.
+    # -----------------------------------------------------------------------
+    first_pay_month = payment_start_month
+    payment_buckets = {}
 
-    has_stub = (t0.day != 1 and t0.day != calendar.monthrange(t0.year, t0.month)[1])
+    for lm in range(1, lock_in + 1):
+        if lm == lock_in:
+            assigned_pay_month = lock_in
+        else:
+            if lm <= first_pay_month:
+                assigned_pay_month = first_pay_month
+            else:
+                steps = ((lm - first_pay_month - 1) // payment_frequency) + 1
+                assigned_pay_month = first_pay_month + steps * payment_frequency
+            assigned_pay_month = min(assigned_pay_month, lock_in)
 
-    if has_stub:
-        stub_days = (end_of_month - t0).days + 1
-        prorated = monthly_rents[0] * (stub_days / days_in_month)
-        dates.append(end_of_month if payment_timing.lower() == "end" else t0)
-        amounts.append(prorated)
-        labels.append("Lease Rental")
-        start_for_regular = end_of_month + timedelta(days=1)
-    else:
-        dates.append(t0 if payment_timing.lower() == "beginning" else end_of_month)
-        amounts.append(monthly_rents[0])
-        labels.append("Lease Rental")
-        start_for_regular = t0 + relativedelta(months=1)
+        if assigned_pay_month not in payment_buckets:
+            payment_buckets[assigned_pay_month] = []
+        payment_buckets[assigned_pay_month].append(lm)
 
-    for i in range(1, int(lock_in_period) + (1 if has_stub else 0)):
-        rent_idx = min(i, len(monthly_rents) - 1)
-        pay_month = start_for_regular + relativedelta(months=i - 1)
-        dim = calendar.monthrange(pay_month.year, pay_month.month)[1]
+    # -----------------------------------------------------------------------
+    # Helper: calendar date on which a bucket's payment is made
+    #
+    #   Rules for the last bucket when has_tail_stub is True:
+    #     • Beginning timing → 1st of the month containing lease_end
+    #                          (tenant pays at the START of the partial month;
+    #                           amount is prorated but date is always the 1st)
+    #     • End timing       → actual lease_end date
+    #                          (tenant pays when the period closes)
+    #
+    #   For all other buckets:
+    #     • Beginning → 1st of the relevant calendar month
+    #     • End       → last day of the relevant calendar month
+    # -----------------------------------------------------------------------
+    def get_payment_date_for_bucket(pay_month_num, bucket_months):
+        # ── Stub month (month 1) ──────────────────────────────────────────
+        if pay_month_num == 1 and has_stub:
+            return t0 if payment_timing.lower() == "beginning" else end_of_month
+
+        # ── Determine the calendar month this bucket maps to ──────────────
+        if has_stub:
+            month_offset = pay_month_num - 2   # month 2 → offset 0
+            base = end_of_month + timedelta(days=1)
+        else:
+            month_offset = pay_month_num - 1   # month 1 → offset 0
+            base = t0
+
+        pay_month_date = base + relativedelta(months=month_offset)
+        dim = calendar.monthrange(pay_month_date.year, pay_month_date.month)[1]
 
         if payment_timing.lower() == "beginning":
-            pay_date = datetime(pay_month.year, pay_month.month, 1).date()
+            # ── Beginning timing ──────────────────────────────────────────
+            # Always the 1st of the month — even for the tail-stub last month.
+            # (The rent amount is prorated via last_month_fraction, but the
+            #  payment DATE is the start of that calendar month.)
+            return datetime(pay_month_date.year, pay_month_date.month, 1).date()
         else:
-            pay_date = datetime(pay_month.year, pay_month.month, dim).date()
+            # ── End timing ────────────────────────────────────────────────
+            # Tail-stub last month: pay on the actual lease end date.
+            # All other months: pay on the last day of the calendar month.
+            if pay_month_num == lock_in and has_tail_stub:
+                return lease_end
+            return datetime(pay_month_date.year, pay_month_date.month, dim).date()
 
+    # -----------------------------------------------------------------------
+    # Helper: prorated (or full) rent for a given lease month number
+    # -----------------------------------------------------------------------
+    def get_month_rent(lm):
+        idx = min(lm - 1, len(monthly_rents) - 1)
+        rent = monthly_rents[idx]
+        if lm == 1 and has_stub:
+            return rent * discount_stub_fraction
+        if lm == lock_in and has_tail_stub:
+            return rent * last_month_fraction
+        return rent
+
+    # -----------------------------------------------------------------------
+    # Build the flat lists of (date, amount, label) from buckets
+    # -----------------------------------------------------------------------
+    dates, amounts, labels = [], [], []
+
+    for pay_month_num in sorted(payment_buckets.keys()):
+        bucket_months = payment_buckets[pay_month_num]
+        total_rent = sum(get_month_rent(lm) for lm in bucket_months)
+        pay_date = get_payment_date_for_bucket(pay_month_num, bucket_months)
         dates.append(pay_date)
-        amounts.append(monthly_rents[rent_idx])
+        amounts.append(total_rent)
         labels.append("Lease Rental")
 
-    # Last Payment Stub Adjustment
-    lease_end = t0 + relativedelta(months=int(lock_in_period)) - timedelta(days=1)
-    if lease_end.day != calendar.monthrange(lease_end.year, lease_end.month)[1]:
-        dim = calendar.monthrange(lease_end.year, lease_end.month)[1]
-        last_rent = monthly_rents[-1]
-        prorated = last_rent * (lease_end.day / dim)
-        dates[-1] = lease_end
-        amounts[-1] = prorated
-
-    # Add Purchase Option
+    # Purchase Option
     if exercise_purchase_option and purchase_option_price > 0:
         dates.append(lease_end)
         amounts.append(purchase_option_price)
         labels.append("Purchase Option")
 
-    # Merge Additional Payments
+    # Additional / deposit payments
     for ap in additional_payments:
         dates.append(ap["date"])
         amounts.append(ap["amount"])
         labels.append(ap["label"])
 
-    # Sort all by date
+    # Sort everything by date
     combined = sorted(zip(dates, amounts, labels), key=lambda x: x[0])
     dates, amounts, labels = zip(*combined)
-    dates = list(dates)
-    amounts = list(amounts)
-    labels = list(labels)
+    dates, amounts, labels = list(dates), list(amounts), list(labels)
 
-    # ===============================
-    # Step 3: PV Calculation
-    # ===============================
-    days_in_start_month = calendar.monthrange(t0.year, t0.month)[1]
-    stub_days = (end_of_month - t0).days + 1 if has_stub else days_in_start_month
-    discount_stub_fraction = stub_days / days_in_start_month
+    # -----------------------------------------------------------------------
+    # Step 4: PV calculation
+    #   Each payment is discounted by its exact month-offset from t0.
+    # -----------------------------------------------------------------------
+    def get_period_for_pv(pay_date, label, true_lease_months):
+        months_diff = (pay_date.year - t0.year) * 12 + (pay_date.month - t0.month)
+
+        if pay_date <= t0:
+            return 0  # Same day or prior deposit → no discounting
+
+        if months_diff == 0:
+            # Same calendar month as t0 (stub payment within month 1)
+            return discount_stub_fraction
+
+        if payment_timing.lower() == "beginning":
+            period = (months_diff - 1) + discount_stub_fraction
+        else:
+            if has_stub:
+                period = months_diff + discount_stub_fraction
+            else:
+                period = months_diff
+
+        return min(period, true_lease_months)
+
+    # Last lease rental gets discounted over the full lock_in horizon
+    lease_rental_indices = [i for i, l in enumerate(labels) if l == "Lease Rental"]
+    last_lease_rental_idx = lease_rental_indices[-1] if lease_rental_indices else -1
 
     pv_list = []
-    lease_rental_indices = [i for i, l in enumerate(labels) if l == "Lease Rental"]
-    last_lease_rental_idx = lease_rental_indices[-1]
-
-    for i in range(len(dates)):
-        amt = amounts[i]
-        months_diff = (dates[i].year - t0.year) * 12 + (dates[i].month - t0.month)
-
-        if dates[i] < t0:
-            period = 0
-
-        elif dates[i] == t0:
-            period = 0
-
-        elif i == last_lease_rental_idx:
-            period = int(lock_in_period)
-
-        elif months_diff == 0:
-            period = discount_stub_fraction
-
+    for i, (pay_date, amt, lbl) in enumerate(zip(dates, amounts, labels)):
+        if i == last_lease_rental_idx:
+            period = true_lease_months
         else:
-            if payment_timing.lower() == "beginning":
-                period = (months_diff - 1) + discount_stub_fraction
-            else:
-                period = months_diff + (discount_stub_fraction if has_stub else 0)
-
+            period = get_period_for_pv(pay_date, lbl, true_lease_months)
         pv = amt / ((1 + monthly_rate) ** period)
         pv_list.append(pv)
 
     lease_liability = sum(pv_list)
     ROU_opening = lease_liability
 
-    # ===============================
-    # ROU Amortization Period
-    # ===============================
+    # -----------------------------------------------------------------------
+    # ROU amortization period
+    # -----------------------------------------------------------------------
     if exercise_purchase_option and asset_life_months > 0:
         amortization_months = int(asset_life_months)
         st.info(f"ℹ️ ROU asset amortized over **{amortization_months} months** (Life of Asset)")
     else:
-        amortization_months = int(lock_in_period)
+        amortization_months = true_lease_months
 
     amortization_per_month = ROU_opening / amortization_months
 
-    # ===============================
-    # Step 4: Build Schedule
-    # ===============================
+    # -----------------------------------------------------------------------
+    # Step 5: Build month-by-month schedule
+    # -----------------------------------------------------------------------
+    payment_map = {}
+    for i, (d, amt, lbl) in enumerate(zip(dates, amounts, labels)):
+        payment_map.setdefault(d, []).append(
+            {"amount": amt, "label": lbl, "pv": pv_list[i]}
+        )
+
     rows = []
     opening_balance = lease_liability
     rou_balance = ROU_opening
-
-    i = 0
     sl_no = 1
 
-    while i < len(dates):
-        # Group all payments on same date
-        same_date_indices = [i]
-        while i + 1 < len(dates) and dates[i + 1] == dates[i]:
-            i += 1
-            same_date_indices.append(i)
+    for lm in range(1, lock_in + 1):
 
-        current_date = dates[same_date_indices[0]]
-        total_payments_today = sum(amounts[k] for k in same_date_indices)
-        months_diff = (current_date.year - t0.year) * 12 + (current_date.month - t0.month)
+        # ── Calendar boundaries for this lease month ──────────────────────
+        if lm == 1 and has_stub:
+            month_start = t0
+            month_end = end_of_month
+        elif has_stub:
+            month_offset = lm - 2
+            base_month = end_of_month + timedelta(days=1) + relativedelta(months=month_offset)
+            dim = calendar.monthrange(base_month.year, base_month.month)[1]
+            month_start = datetime(base_month.year, base_month.month, 1).date()
+            month_end = datetime(base_month.year, base_month.month, dim).date()
+        else:
+            base_month = t0 + relativedelta(months=lm - 1)
+            dim = calendar.monthrange(base_month.year, base_month.month)[1]
+            month_start = datetime(base_month.year, base_month.month, 1).date()
+            month_end = datetime(base_month.year, base_month.month, dim).date()
 
-        # ===============================
-        # Interest Calculation
-        # ===============================
-        if current_date < t0:
-            # Prior deposit — lease not yet commenced, no interest
-            interest = 0.0
+        # ── Fraction of month (for interest and ROU amortization) ─────────
+        if lm == 1:
+            first_payment_date = get_payment_date_for_bucket(1, payment_buckets.get(1, []))
 
-        elif has_stub and months_diff == 0 and same_date_indices[0] == 0:
-            # First stub period payment
-            if payment_timing.lower() == "beginning":
-                interest = (opening_balance - total_payments_today) * monthly_rate * discount_stub_fraction
+            # ✅ If no time gap → no interest
+            if first_payment_date == t0:
+                month_fraction = 0
+            elif has_stub:
+                month_fraction = discount_stub_fraction
             else:
-                interest = opening_balance * monthly_rate * discount_stub_fraction
+                month_fraction = 1.0
 
-        elif last_lease_rental_idx in same_date_indices and has_stub:
-            # Last partial (stub tail) period
-            dim_last = calendar.monthrange(current_date.year, current_date.month)[1]
-            last_fraction = current_date.day / dim_last
-            if payment_timing.lower() == "beginning":
-                interest = (opening_balance - total_payments_today) * monthly_rate * last_fraction
-            else:
-                interest = opening_balance * monthly_rate * last_fraction
+        elif lm == lock_in and has_tail_stub:
+            month_fraction = last_month_fraction
 
         else:
-            # All regular full months including t0 no-stub first payment
-            if payment_timing.lower() == "beginning":
-                # Payment made on day 1; interest accrues on post-payment balance for the month
-                interest = (opening_balance - total_payments_today) * monthly_rate
-            else:
-                # Payment at end; interest accrues on full opening balance
-                interest = opening_balance * monthly_rate
+            month_fraction = 1.0
 
-        # ===============================
-        # Apply payments row by row
-        # ===============================
-        interest_applied = False
+        # ── Cash payments that fall within this lease month's window ───────
+        cash_payments_this_month = [
+            (pay_date, p)
+            for pay_date, pay_list in payment_map.items()
+            if month_start <= pay_date <= month_end
+            for p in pay_list
+        ]
+        cash_payments_this_month.sort(key=lambda x: x[0])
 
-        for idx in same_date_indices:
-            payment = amounts[idx]
-            label = labels[idx]
+        total_cash_this_month = sum(p["amount"] for _, p in cash_payments_this_month)
 
-            if not interest_applied:
-                row_interest = interest
-                if payment_timing.lower() == "beginning":
-                    balance_after_interest = (opening_balance - total_payments_today) + interest + payment
+        # ── Interest ───────────────────────────────────────────────────────
+        if payment_timing.lower() == "beginning":
+            interest = (opening_balance - total_cash_this_month) * monthly_rate * month_fraction
+        else:
+            interest = opening_balance * monthly_rate * month_fraction
+
+        # ── ROU amortization ───────────────────────────────────────────────
+        # Force the last lease month to consume the exact remaining ROU balance
+        # so the closing figure is precisely 0.00 with no floating-point residual.
+        if lm == lock_in:
+            rou_amort = rou_balance
+        else:
+            rou_amort = amortization_per_month * month_fraction
+
+        # ── Emit rows ──────────────────────────────────────────────────────
+        if cash_payments_this_month:
+            interest_applied = False
+            for pay_date, p in cash_payments_this_month:
+                payment = p["amount"]
+                lbl = p["label"]
+
+                if lbl == "Purchase Option":
+                    row_rou_amort = 0.0
+                elif not interest_applied:
+                    row_rou_amort = rou_amort
                 else:
-                    balance_after_interest = opening_balance + interest
+                    row_rou_amort = 0.0
+
+                row_interest = interest if not interest_applied else 0.0
                 interest_applied = True
-            else:
-                row_interest = 0.0
-                balance_after_interest = opening_balance
 
-            closing_balance = balance_after_interest - payment
+                closing_balance = opening_balance + row_interest - payment
+                rou_balance -= row_rou_amort
 
-            # ROU Amortization
-            if label not in ["Lease Rental", "Purchase Option"]:
-                rou_amort = 0.0
-            elif label == "Purchase Option":
-                rou_amort = 0.0
-            elif idx == 0:
-                rou_amort = amortization_per_month * discount_stub_fraction
-            elif idx == last_lease_rental_idx and has_stub:
-                rou_amort = amortization_per_month * (1 - discount_stub_fraction)
-            else:
-                rou_amort = amortization_per_month
+                rows.append([
+                    sl_no,
+                    pay_date.strftime("%Y-%m-%d"),
+                    lbl,
+                    round(payment, 2),
+                    round(p["pv"], 2),
+                    round(opening_balance, 2),
+                    round(payment, 2),
+                    round(row_interest, 2),
+                    round(closing_balance, 2),
+                    round(rou_balance + row_rou_amort, 2),
+                    round(row_rou_amort, 2),
+                    round(rou_balance, 2),
+                ])
 
+                opening_balance = closing_balance
+                sl_no += 1
+
+        else:
+            # No cash payment this month — accrue interest and amortize ROU
+            closing_balance = opening_balance + interest
             rou_balance -= rou_amort
 
             rows.append([
                 sl_no,
-                current_date.strftime("%Y-%m-%d"),
-                label,
-                round(payment, 2),
-                round(pv_list[idx], 2),
+                month_end.strftime("%Y-%m-%d"),
+                "Interest Accrual",
+                0.0,
+                0.0,
                 round(opening_balance, 2),
-                round(payment, 2),
-                round(row_interest, 2),
+                0.0,
+                round(interest, 2),
                 round(closing_balance, 2),
                 round(rou_balance + rou_amort, 2),
                 round(rou_amort, 2),
-                round(rou_balance, 2)
+                round(rou_balance, 2),
             ])
 
             opening_balance = closing_balance
             sl_no += 1
 
-        i += 1
-
+    # -----------------------------------------------------------------------
+    # Display
+    # -----------------------------------------------------------------------
     df = pd.DataFrame(rows, columns=[
         "Sl No.", "Installment Date", "Payment Type", "Amount Paid", "PV of Installment",
         "Opening Lease Liability", "Payment", "Interest", "Closing Lease Liability",
-        "ROU Opening", "Amortization", "ROU Closing"
+        "ROU Opening", "Amortization", "ROU Closing",
     ])
 
     if rent_inclusive_of_gst and gst_rate > 0:
         st.info(f"ℹ️ All amounts shown are net of GST @ {gst_rate}%")
 
+    if payment_frequency > 1:
+        st.info(
+            f"ℹ️ Payment frequency: every **{payment_frequency} months** "
+            f"(starting lease month {payment_start_month}). "
+            f"Months without cash payments are shown as **Interest Accrual** rows."
+        )
+
     st.success("✅ Lease Schedule Generated Successfully")
     st.dataframe(df, use_container_width=True)
+
+    total_payments = df[df["Payment Type"] == "Lease Rental"]["Amount Paid"].sum()
+    total_interest = df["Interest"].sum()
+    st.markdown(f"""
+    **Schedule Summary:**
+    - Initial Lease Liability (PV): ₹{lease_liability:,.2f}
+    - Total Lease Rent Payments: ₹{total_payments:,.2f}
+    - Total Interest Accrued: ₹{total_interest:,.2f}
+    - Payment Frequency: {selected_frequency_label}
+    """)
 
     buffer = io.BytesIO()
     df.to_excel(buffer, index=False, engine="openpyxl")
@@ -756,5 +997,5 @@ if st.button("Generate Schedule"):
         label="📥 Download Excel",
         data=buffer,
         file_name="Lease_Schedule.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
